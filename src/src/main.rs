@@ -11,6 +11,8 @@ use web3::signing::SecretKey;
 use hex;
 use tokio;
 use generic_array::GenericArray;
+use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 const KERNEL_SOURCE: &str = include_str!("kernel.cl");
 
@@ -22,7 +24,6 @@ struct Config {
     batch_size: u64,
 }
 
-/// Fetches the current mining difficulty from the smart contract.
 async fn fetch_difficulty(
     contract: &Contract<Http>,
 ) -> Result<U256, Box<dyn std::error::Error + Send + Sync>> {
@@ -30,7 +31,6 @@ async fn fetch_difficulty(
     Ok(difficulty)
 }
 
-/// Computes the target based on the current difficulty.
 fn compute_target(difficulty: U256) -> Vec<u8> {
     let max_val = U256::MAX;
     let target = max_val / difficulty;
@@ -39,34 +39,54 @@ fn compute_target(difficulty: U256) -> Vec<u8> {
     target_bytes
 }
 
-/// Displays the wallet's balance.
 async fn display_wallet_balance(
-    web3: &Web3<Http>, 
-    wallet_address: Address
+    web3: &Web3<Http>,
+    wallet_address: Address,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let balance = web3.eth().balance(wallet_address, None).await?;
     println!("Wallet balance: {} MATIC", balance / U256::exp10(18));
     Ok(())
 }
 
-/// Submits a valid nonce to the smart contract.
 async fn submit_solution(
     contract: &Contract<Http>,
     private_key: SecretKey,
+    web3: &Web3<Http>,
+    wallet_address: Address,
     nonce: u64,
+    submitted_nonces: &mut HashSet<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if submitted_nonces.contains(&nonce) {
+        return Ok(());
+    }
+
+    let gas_price = web3.eth().gas_price().await?;
+    let adjusted_gas_price = gas_price + (gas_price / 10);
+    let current_nonce = web3.eth().transaction_count(wallet_address, None).await?;
+
     let options = Options {
-        value: Some(U256::exp10(16)), // 0.01 MATIC in Wei
+        nonce: Some(current_nonce),
+        gas_price: Some(adjusted_gas_price),
+        value: Some(U256::exp10(16)),
         ..Default::default()
     };
-    let tx_hash = contract
+
+    match contract
         .signed_call("mine", (nonce,), options, &private_key)
-        .await?;
-    println!("Submitted nonce {} with TX: {:?}", nonce, tx_hash);
-    Ok(())
+        .await
+    {
+        Ok(tx_hash) => {
+            println!("Submitted nonce {} with TX: {:?}", nonce, tx_hash);
+            submitted_nonces.insert(nonce);
+            Ok(())
+        }
+        Err(e) => {
+            eprintln!("Error submitting nonce {}: {:?}", nonce, e);
+            Err(Box::new(e))
+        }
+    }
 }
 
-/// Lists all available GPU devices across platforms.
 fn list_gpus() -> Result<Vec<(Platform, Device)>, Box<dyn std::error::Error + Send + Sync>> {
     let platforms = Platform::list();
     let mut gpu_devices = Vec::new();
@@ -86,7 +106,6 @@ fn list_gpus() -> Result<Vec<(Platform, Device)>, Box<dyn std::error::Error + Se
     }
 }
 
-/// Sets up the OpenCL queue and kernel.
 fn setup_opencl(
     platform: &Platform,
     device: &Device,
@@ -118,7 +137,6 @@ fn setup_opencl(
     Ok((queue, kernel))
 }
 
-/// GPU Mining loop for a single GPU.
 async fn gpu_mine_single(
     contract: Contract<Http>,
     address: Address,
@@ -128,6 +146,8 @@ async fn gpu_mine_single(
     target: Vec<u8>,
     batch_size: u64,
     start_nonce: u64,
+    web3: Web3<Http>,
+    submitted_nonces: &mut HashSet<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut message_data = vec![0u8; 52];
     message_data[..20].copy_from_slice(address.as_bytes());
@@ -146,7 +166,7 @@ async fn gpu_mine_single(
 
     let solutions = Buffer::<u64>::builder()
         .queue(queue.clone())
-        .len(batch_size as usize)
+        .len(batch_size as usize * 1000)
         .fill_val(0u64)
         .build()?;
 
@@ -159,22 +179,27 @@ async fn gpu_mine_single(
     let mut nonce = start_nonce;
 
     loop {
+        let batch_start_time = Instant::now(); // Start timing for this batch
         solution_count.cmd().write(&vec![0u32]).enq()?;
         kernel.set_arg(0, &d_message)?;
         kernel.set_arg(1, &d_target)?;
         kernel.set_arg(2, &nonce)?;
-        kernel.set_arg(3, &(batch_size as u32))?;
+        kernel.set_arg(3, &(batch_size as u32 * 1000))?;
         kernel.set_arg(4, &solutions)?;
         kernel.set_arg(5, &solution_count)?;
 
         unsafe {
             kernel.cmd()
-            .global_work_size([batch_size as usize * 256]) // 256 threads per work group
-            .local_work_size([256]) // Local threads aligned to warp size
-            .enq()?;
+                .global_work_size([batch_size as usize * 512])
+                .local_work_size([256])
+                .enq()?;
         }
 
-        let mut found_solutions = vec![0u64; batch_size as usize];
+        let elapsed_batch = batch_start_time.elapsed().as_secs_f64();
+        let hashrate = (batch_size * 1000) as f64 / elapsed_batch;
+        println!("Hashrate: {:.2} H/s", hashrate);
+
+        let mut found_solutions = vec![0u64; batch_size as usize * 1000];
         solutions.read(&mut found_solutions).enq()?;
 
         let mut sol_count_host = vec![0u32];
@@ -182,26 +207,36 @@ async fn gpu_mine_single(
         let sol_count = sol_count_host[0];
 
         if sol_count > 0 {
-            println!("Found {} potential solution(s)", sol_count);
-            for &potential_nonce in &found_solutions[..sol_count as usize] {
+            println!(
+                "Buffer size: {}, Found solutions: {}, Processing limit: {}",
+                found_solutions.len(),
+                sol_count,
+                std::cmp::min(sol_count as usize, found_solutions.len())
+            );
+
+            let limit = std::cmp::min(sol_count as usize, found_solutions.len());
+            for &potential_nonce in &found_solutions[..limit] {
                 if verify_nonce(&address, potential_nonce, &target) {
                     println!("Verified nonce: {}", potential_nonce);
-                    submit_solution(&contract, private_key.clone(), potential_nonce).await?;
-                    return Ok(());
+                    submit_solution(
+                        &contract,
+                        private_key.clone(),
+                        &web3,
+                        address,
+                        potential_nonce,
+                        submitted_nonces,
+                    )
+                    .await?;
                 }
             }
         }
 
-        nonce += batch_size * 2; // Increment nonce for this GPU
+        nonce += batch_size * 2;
     }
 }
 
-/// Verifies the nonce on the CPU.
-fn verify_nonce(
-    address: &Address,
-    nonce: u64,
-    target: &[u8],
-) -> bool {
+
+fn verify_nonce(address: &Address, nonce: u64, target: &[u8]) -> bool {
     let mut message = Vec::new();
     message.extend_from_slice(address.as_bytes());
 
@@ -222,7 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .arg(Arg::new("contract_address").long("contract").required(true))
         .arg(Arg::new("wallet_address").long("wallet").required(true))
         .arg(Arg::new("private_key").long("private").required(true))
-        .arg(Arg::new("batch_size").long("batch").default_value("1000000"))
+        .arg(Arg::new("batch_size").long("batch").default_value("10000"))
         .arg(
             Arg::new("device-indices")
                 .long("device-indices")
@@ -263,6 +298,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mut handles = Vec::new();
+    let mut submitted_nonces: HashSet<u64> = HashSet::new();
+
     for (i, (platform, device)) in selected_devices.iter().enumerate() {
         println!("Using GPU at index {}: {} on platform {}", i, device.name()?, platform.name()?);
         let (queue, kernel) = setup_opencl(platform, device)?;
@@ -271,9 +308,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let private_key = private_key.clone();
         let target = target.clone();
         let start_nonce = i as u64 * batch_size;
+        let web3_clone = web3.clone();
+        let mut nonce_tracker = submitted_nonces.clone();
 
         handles.push(tokio::spawn(async move {
-            gpu_mine_single(contract, address, private_key, queue, kernel, target, batch_size, start_nonce).await
+            gpu_mine_single(
+                contract,
+                address,
+                private_key,
+                queue,
+                kernel,
+                target,
+                batch_size,
+                start_nonce,
+                web3_clone,
+                &mut nonce_tracker,
+            )
+            .await
         }));
     }
 
