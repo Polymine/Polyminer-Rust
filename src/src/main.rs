@@ -40,7 +40,10 @@ fn compute_target(difficulty: U256) -> Vec<u8> {
 }
 
 /// Displays the wallet's balance.
-async fn display_wallet_balance(web3: &Web3<Http>, wallet_address: Address) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn display_wallet_balance(
+    web3: &Web3<Http>, 
+    wallet_address: Address
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let balance = web3.eth().balance(wallet_address, None).await?;
     println!("Wallet balance: {} MATIC", balance / U256::exp10(18));
     Ok(())
@@ -63,19 +66,33 @@ async fn submit_solution(
     Ok(())
 }
 
-/// Lists all available GPU devices.
-fn list_gpus() -> Result<Vec<Device>, Box<dyn std::error::Error + Send + Sync>> {
+/// Lists all available GPU devices across platforms.
+fn list_gpus() -> Result<Vec<(Platform, Device)>, Box<dyn std::error::Error + Send + Sync>> {
     let platforms = Platform::list();
-    let mut devices = Vec::new();
+    let mut gpu_devices = Vec::new();
+
     for platform in platforms {
-        devices.extend(Device::list(platform, Some(ocl::flags::DEVICE_TYPE_GPU))?);
+        if let Ok(devices) = Device::list(platform, Some(ocl::flags::DEVICE_TYPE_GPU)) {
+            for device in devices {
+                gpu_devices.push((platform, device));
+            }
+        }
     }
-    Ok(devices)
+
+    if gpu_devices.is_empty() {
+        Err("No GPU devices found!".into())
+    } else {
+        Ok(gpu_devices)
+    }
 }
 
 /// Sets up the OpenCL queue and kernel.
-fn setup_opencl(device: &Device) -> Result<(Queue, Kernel), Box<dyn std::error::Error + Send + Sync>> {
+fn setup_opencl(
+    platform: &Platform,
+    device: &Device,
+) -> Result<(Queue, Kernel), Box<dyn std::error::Error + Send + Sync>> {
     let context = ContextBuilder::new()
+        .platform(*platform)
         .devices(*device)
         .build()?;
 
@@ -245,9 +262,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     let mut handles = Vec::new();
-    for (i, device) in selected_devices.iter().enumerate() {
-        println!("Using GPU at index {}: {}", i, device.name()?);
-        let (queue, kernel) = setup_opencl(device)?;
+    for (i, (platform, device)) in selected_devices.iter().enumerate() {
+        println!("Using GPU at index {}: {} on platform {}", i, device.name()?, platform.name()?);
+        let (queue, kernel) = setup_opencl(platform, device)?;
         let contract = contract.clone();
         let address = wallet_address;
         let private_key = private_key.clone();
