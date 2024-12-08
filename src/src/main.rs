@@ -169,8 +169,9 @@ async fn gpu_mine_single(
 
         unsafe {
             kernel.cmd()
-                .global_work_size([batch_size as usize])
-                .enq()?;
+            .global_work_size([batch_size as usize * 256]) // 256 threads per work group
+            .local_work_size([256]) // Local threads aligned to warp size
+            .enq()?;
         }
 
         let mut found_solutions = vec![0u64; batch_size as usize];
