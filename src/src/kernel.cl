@@ -125,40 +125,48 @@ __kernel void hashMessage(
     ulong startPosition,
     uint maxSolutionCount,
     __global ulong *solutions,
-    __global uint *solutionCount)
-{
+    __global uint *solutionCount
+) {
+    __local uchar target_local[UINT256_LENGTH];
     uchar digest[UINT256_LENGTH];
     uchar message[MESSAGE_LENGTH];
-    __local uchar target_local[UINT256_LENGTH];
+    nonce_t nonce;
 
-    barrier(CLK_LOCAL_MEM_FENCE);
+    // Load target into local memory
     if (get_local_id(0) == 0) {
-        for(uint i = 0; i < UINT256_LENGTH; i++) {
+        for (uint i = 0; i < UINT256_LENGTH; i++) {
             target_local[i] = d_target[i];
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
-    for (uint i=0; i<MESSAGE_LENGTH; i++)
+    // Load message into registers
+    for (uint i = 0; i < MESSAGE_LENGTH; i++) {
         message[i] = d_message[i];
-
-    nonce_t nonce;
-    nonce.uint64_t = startPosition + get_global_id(0);
-
-    for (uint i=0; i<UINT256_LENGTH; i++) {
-        if (i < 24u) {
-            message[NONCE_POSITION + i] = 0u;
-        } else {
-            message[NONCE_POSITION + i] = nonce.uint8_t[UINT64_LENGTH - 1 - (i - 24)];
-        }
     }
 
-    keccak256(digest, message);
+    // Initialize nonce
+    nonce.uint64_t = startPosition + get_global_id(0);
 
-    if (compare(digest, (__local uchar *)target_local, UINT256_LENGTH) < 0) {
-        uint idx = atomic_inc(&solutionCount[0]);
-        if(idx < maxSolutionCount){
-            solutions[idx] = nonce.uint64_t;
+    // Process multiple nonces per thread
+    for (uint i = 0; i < 256; i++) { // Process 256 nonces per thread
+        nonce.uint64_t += i;
+
+        for (uint j = 0; j < UINT256_LENGTH; j++) {
+            if (j < 24u) {
+                message[NONCE_POSITION + j] = 0u;
+            } else {
+                message[NONCE_POSITION + j] = nonce.uint8_t[UINT64_LENGTH - 1 - (j - 24)];
+            }
+        }
+
+        keccak256(digest, message);
+
+        if (compare(digest, target_local, UINT256_LENGTH) < 0) {
+            uint idx = atomic_inc(&solutionCount[0]);
+            if (idx < maxSolutionCount) {
+                solutions[idx] = nonce.uint64_t;
+            }
         }
     }
 }
