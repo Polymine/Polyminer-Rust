@@ -1,4 +1,3 @@
-# PolyMiner README
 
 ## **PolyMiner: A Rust-based GPU Miner**
 
