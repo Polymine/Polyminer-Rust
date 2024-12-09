@@ -35,9 +35,9 @@ jobs:
         choco install opencl-sdk -y
         choco install llvm -y
 
-    - name: Install dependencies (macOS)
+    - name: Skip dependency installation on macOS
       if: runner.os == 'macOS'
-      run: brew install opencl
+      run: echo "macOS already includes OpenCL support."
 
     - name: Install Rust
       uses: actions-rs/toolchain@v1
