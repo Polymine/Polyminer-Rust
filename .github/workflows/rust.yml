@@ -16,64 +16,89 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Check out code
-      uses: actions/checkout@v4
-
-    - name: Install Rust
-      uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-
-    - name: Build for Linux
-      run: cargo build --release --verbose
-
-    - name: Run tests
-      run: cargo test --verbose
-
-  release:
-    needs: build-and-test
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        platform: [linux, windows, macos]
     runs-on: ${{ matrix.os }}
 
     steps:
     - name: Check out code
       uses: actions/checkout@v4
 
+    - name: Install dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+
+    - name: Install dependencies (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        choco install opencl-sdk -y
+        choco install llvm -y
+
+    - name: Install dependencies (macOS)
+      if: runner.os == 'macOS'
+      run: brew install opencl
+
     - name: Install Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
 
-    - name: Build the project
+    - name: Build
       run: |
-        if [ "${{ matrix.platform }}" == "windows" ]; then
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
           cargo build --release --target x86_64-pc-windows-msvc
-        elif [ "${{ matrix.platform }}" == "macos" ]; then
+        elif [[ "${{ matrix.os }}" == "macos-latest" ]]; then
           cargo build --release --target x86_64-apple-darwin
         else
           cargo build --release
         fi
 
-    - name: Upload release artifact
+    - name: Run tests
+      run: cargo test --verbose
+
+    - name: Archive artifacts (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        mkdir -p artifacts
+        cp target/release/polyminer artifacts/
+        tar -czvf artifacts/polyminer-linux.tar.gz -C artifacts polyminer
+      shell: bash
+
+    - name: Archive artifacts (Windows)
+      if: runner.os == 'Windows'
+      run: |
+        mkdir artifacts
+        copy target\release\polyminer.exe artifacts\
+        tar -czvf artifacts\polyminer-windows.tar.gz -C artifacts polyminer.exe
+
+    - name: Archive artifacts (macOS)
+      if: runner.os == 'macOS'
+      run: |
+        mkdir -p artifacts
+        cp target/release/polyminer artifacts/
+        tar -czvf artifacts/polyminer-macos.tar.gz -C artifacts polyminer
+      shell: bash
+
+    - name: Upload artifacts
       uses: actions/upload-artifact@v3
       with:
-        name: polyminer-${{ matrix.platform }}
-        path: |
-          target/release/polyminer${{ matrix.platform == 'windows' && '.exe' || '' }}
+        name: polyminer-${{ matrix.os }}
+        path: artifacts/*.tar.gz
 
-    - name: Create GitHub Release
-      if: matrix.platform == 'linux'
+  create-release:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Upload Release
       uses: softprops/action-gh-release@v1
       with:
         files: |
-          target/release/polyminer
-          target/x86_64-pc-windows-msvc/release/polyminer.exe
-          target/x86_64-apple-darwin/release/polyminer
+          artifacts/polyminer-linux.tar.gz
+          artifacts/polyminer-windows.tar.gz
+          artifacts/polyminer-macos.tar.gz
       env:
-        GITHUB_TOKEN: ${{ secrets.PAT_GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
