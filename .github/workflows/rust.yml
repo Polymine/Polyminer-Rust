@@ -76,4 +76,4 @@ jobs:
           target/x86_64-pc-windows-msvc/release/polyminer.exe
           target/x86_64-apple-darwin/release/polyminer
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.PAT_GITHUB_TOKEN }}
