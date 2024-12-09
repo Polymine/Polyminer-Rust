@@ -25,24 +25,26 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Install dependencies (Linux)
-      if: runner.os == 'Linux'
-      run: sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
-
-    - name: Install dependencies (Windows)
-      if: runner.os == 'Windows'
+    - name: Install dependencies
       run: |
-        choco install opencl-sdk -y
-        choco install llvm -y
-
-    - name: Skip dependency installation on macOS
-      if: runner.os == 'macOS'
-      run: echo "macOS already includes OpenCL support."
+        if [[ "${{ matrix.os }}" == "ubuntu-latest" ]]; then
+          sudo apt-get update && sudo apt-get install -y ocl-icd-opencl-dev
+        elif [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          choco install opencl-sdk -y
+          choco install llvm -y
+        else
+          echo "macOS already includes OpenCL support."
+        fi
 
     - name: Install Rust
       uses: actions-rs/toolchain@v1
       with:
         toolchain: stable
+        override: true
+
+    - name: Install macOS target
+      if: runner.os == 'macOS'
+      run: rustup target add x86_64-apple-darwin
 
     - name: Build
       run: |
@@ -57,34 +59,23 @@ jobs:
     - name: Run tests
       run: cargo test --verbose
 
-    - name: Archive artifacts (Linux)
-      if: runner.os == 'Linux'
+    - name: Archive artifacts
       run: |
         mkdir -p artifacts
-        cp target/release/polyminer artifacts/
-        tar -czvf artifacts/polyminer-linux.tar.gz -C artifacts polyminer
-      shell: bash
-
-    - name: Archive artifacts (Windows)
-      if: runner.os == 'Windows'
-      run: |
-        mkdir artifacts
-        copy target\release\polyminer.exe artifacts\
-        tar -czvf artifacts\polyminer-windows.tar.gz -C artifacts polyminer.exe
-
-    - name: Archive artifacts (macOS)
-      if: runner.os == 'macOS'
-      run: |
-        mkdir -p artifacts
-        cp target/release/polyminer artifacts/
-        tar -czvf artifacts/polyminer-macos.tar.gz -C artifacts polyminer
+        if [[ "${{ matrix.os }}" == "windows-latest" ]]; then
+          cp target/release/polyminer.exe artifacts/
+          7z a artifacts/polyminer-windows.zip artifacts/polyminer.exe
+        else
+          cp target/release/polyminer artifacts/
+          tar -czvf artifacts/polyminer-${{ matrix.os }}.tar.gz -C artifacts polyminer
+        fi
       shell: bash
 
     - name: Upload artifacts
       uses: actions/upload-artifact@v3
       with:
         name: polyminer-${{ matrix.os }}
-        path: artifacts/*.tar.gz
+        path: artifacts/*
 
   create-release:
     needs: build-and-test
@@ -93,12 +84,18 @@ jobs:
     - name: Check out code
       uses: actions/checkout@v4
 
-    - name: Upload Release
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      with:
+        path: artifacts
+
+    - name: Release
       uses: softprops/action-gh-release@v1
+      if: startsWith(github.ref, 'refs/tags/')
       with:
         files: |
-          artifacts/polyminer-linux.tar.gz
-          artifacts/polyminer-windows.tar.gz
-          artifacts/polyminer-macos.tar.gz
+          artifacts/polyminer-ubuntu-latest/polyminer-ubuntu-latest.tar.gz
+          artifacts/polyminer-windows-latest/polyminer-windows.zip
+          artifacts/polyminer-macos-latest/polyminer-macos-latest.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
