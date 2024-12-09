@@ -35,6 +35,7 @@ jobs:
         else
           echo "macOS already includes OpenCL support."
         fi
+      shell: bash
 
     - name: Install Rust
       uses: actions-rs/toolchain@v1
@@ -45,6 +46,7 @@ jobs:
     - name: Install macOS target
       if: runner.os == 'macOS'
       run: rustup target add x86_64-apple-darwin
+      shell: bash
 
     - name: Build
       run: |
@@ -55,9 +57,11 @@ jobs:
         else
           cargo build --release
         fi
+      shell: bash
 
     - name: Run tests
       run: cargo test --verbose
+      shell: bash
 
     - name: Archive artifacts
       run: |
