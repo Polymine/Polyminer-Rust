@@ -107,7 +107,7 @@ async fn fetch_difficulty(
 }
 
 /// Computes the target based on the current difficulty.
-fn compute_target(difficulty: u64) -> Vec<u8> { // Parameter changed to u64
+fn compute_target(difficulty: u64) -> Vec<u8> {
     let max_val = U256::MAX;
     let difficulty_u256 = U256::from(difficulty);
     let target = max_val / difficulty_u256;
@@ -338,11 +338,11 @@ async fn gpu_mine_single(
     kernel: Kernel,
     target: Vec<u8>,
     batch_size: u64,
-    global_nonce_counter: Arc<Mutex<u64>>, // Using tokio::Mutex<u64>
+    global_nonce_counter: Arc<Mutex<u64>>,
     web3: Web3<Http>,
-    submitted_nonces: Arc<Mutex<HashSet<u64>>>, // Using HashSet<u64>
+    submitted_nonces: Arc<Mutex<HashSet<u64>>>,
     target_hashrate: f64,
-    tx_nonce_counter: Arc<Mutex<u64>>, // Using tokio::Mutex<u64>
+    tx_nonce_counter: Arc<Mutex<u64>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Starting mining loop on GPU.");
 
@@ -363,20 +363,22 @@ async fn gpu_mine_single(
         .len(32)
         .build()?;
 
-    // Initial buffer allocation for solution_count
-    let solution_count = Buffer::<u32>::builder() // Using u32
+    let solution_count = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(flags::MEM_READ_WRITE)
         .len(1)
         .build()?;
 
-        let mut current_batch_size = batch_size;
-        let mut last_check = Instant::now();
-        let mut cached_difficulty = fetch_difficulty(&contract).await?;
-        let mut target = compute_target(cached_difficulty);
+    let mut current_batch_size = batch_size;
+    let mut last_check = Instant::now();
+    let mut cached_difficulty = fetch_difficulty(&contract).await?;
+    let mut target = compute_target(cached_difficulty);
+
+    let mut solutions_found = 0u32;
+    let mut solutions_submitted = 0u32;
+    let mut solutions_rejected = 0u32;
 
     loop {
-        // Fetch the latest difficulty before mining
         if last_check.elapsed() >= Duration::from_secs(180) {
             let new_difficulty = fetch_difficulty(&contract).await?;
             if new_difficulty != cached_difficulty {
@@ -387,331 +389,254 @@ async fn gpu_mine_single(
             last_check = Instant::now();
         }
 
-        // Allocate solutions buffer with current_batch_size * 1000 * 4
         let solutions = Buffer::<u64>::builder()
             .queue(queue.clone())
             .flags(flags::MEM_WRITE_ONLY)
-            .len(current_batch_size as usize * 1000 * 4) // Match with kernel's expectation
+            .len(current_batch_size as usize * 1000 * 4)
             .build()?;
 
-        // Reset solution count
         solution_count.cmd().write(&vec![0u32]).enq()?;
-        debug!("Solution count reset.");
 
-        // Fetch a unique starting nonce atomically
         let mut global_nonce = global_nonce_counter.lock().await;
         let nonce = *global_nonce;
         *global_nonce += current_batch_size * 1000;
-        debug!("Assigned nonce range starting at {}", nonce);
 
-        // Set kernel arguments
         kernel.set_arg(0, &d_message)?;
         kernel.set_arg(1, &d_target)?;
-        kernel.set_arg(2, nonce)?; // startPosition as u64
-        kernel.set_arg(3, batch_size as u32 * 1000 * 4)?; // maxSolutionCount as u32
+        kernel.set_arg(2, nonce)?;
+        kernel.set_arg(3, batch_size as u32 * 1000 * 4)?;
         kernel.set_arg(4, &solutions)?;
         kernel.set_arg(5, &solution_count)?;
-        debug!("Kernel arguments set for nonce range starting at {}", nonce);
 
-        // Define local and global work sizes
         let local_work_size = 256;
         let global_work_size = ((current_batch_size * 1000 + local_work_size - 1) / local_work_size) * local_work_size;
 
-        // Enqueue kernel execution with profiling using Instant
         let start_time = Instant::now();
-        debug!("Enqueuing mining kernel with global work size: {}", global_work_size);
         unsafe {
-            match kernel
+            kernel
                 .cmd()
                 .global_work_size([global_work_size as usize])
                 .local_work_size([local_work_size as usize])
-                .enq() {
-                        Ok(_) => debug!("Kernel executed successfully"),
-                        Err(e) => {
-                                    error!("Kernel execution error: {:?}", e);
-                                    return Err(Box::new(e));
-            }
+                .enq()?;
         }
-}
         let elapsed = start_time.elapsed();
         let elapsed_sec = elapsed.as_secs_f64();
-        debug!("Kernel execution completed in {:.2} seconds.", elapsed_sec);
 
-        // Prevent division by zero
         if elapsed_sec == 0.0 {
             warn!("Elapsed time for kernel execution is zero. Skipping this iteration.");
-            continue; // Skip this iteration
+            continue;
         }
 
-        // Calculate hashrate
         let total_nonces = current_batch_size * 1000 * 4;
         let hashrate = (total_nonces as f64) / elapsed_sec;
 
-        // Sanity check for hashrate
-        if hashrate.is_infinite() || hashrate.is_nan() || hashrate < 0.0 {
-            error!("Invalid hashrate calculated: {:.2} H/s. Skipping adjustment.", hashrate);
-        } else {
-            // Dynamic Hashrate Display on the Same Line
-            print!("\rHashrate: {:.2} H/s", hashrate);
-            io::stdout().flush().unwrap();
-            info!("Current Hashrate: {:.2} H/s", hashrate);
+        // Update dynamic display
+        print!("\rHashrate: {:.2} H/s [Solutions: {}] [Submitted: {}] [Rejected: {}]", hashrate, solutions_found, solutions_submitted, solutions_rejected);
+        io::stdout().flush().unwrap();
 
-            // Read solutions from GPU
+        let mut sol_count_host = vec![0u32];
+        solution_count.read(&mut sol_count_host).enq()?;
+        let sol_count = sol_count_host[0];
+
+        solutions_found += sol_count;
+
+        if sol_count > 0 {
             let mut found_solutions = vec![0u64; current_batch_size as usize * 1000 * 4];
-            solutions.read(&mut found_solutions[..]).enq()?; // Ensure this line is active
-            debug!("Solutions buffer read successfully.");
+            solutions.read(&mut found_solutions[..]).enq()?;
 
-            // Read the number of solutions found
-            let mut sol_count_host = vec![0u32];
-            solution_count.read(&mut sol_count_host).enq()?;
-            let sol_count = sol_count_host[0];
-
-            info!("Found {} solutions.", sol_count);
-
-            if sol_count > 0 {
-                for &potential_nonce in &found_solutions[..sol_count as usize] {
-                    if potential_nonce != 0 {
-                        info!("GPU found potential nonce: {}", potential_nonce);
-                        // Verify the nonce before submission
-                        let is_valid = verify_nonce(&address, potential_nonce, &target);
-                        if is_valid {
-                            {
-                                let mut submitted = submitted_nonces.lock().await;
-                                if !submitted.contains(&potential_nonce) {
-                                    submitted.insert(potential_nonce);
-                                    debug!("Nonce {} verified and added to submitted_nonces.", potential_nonce);
-                                    
-                                    match submit_solution(
-                                        &contract,
-                                        &private_key,
-                                        &web3,
-                                        address,
-                                        potential_nonce,
-                                        submitted_nonces.clone(),
-                                        tx_nonce_counter.clone(),
-                                    ).await {
-                                        Ok(_) => info!("Nonce {} submitted successfully.", potential_nonce),
-                                        Err(e) => error!("Failed to submit nonce {}: {:?}", potential_nonce, e),
-                                    }
-                                } else {
-                                    warn!("Nonce {} already submitted. Skipping.", potential_nonce);
+            for &potential_nonce in &found_solutions[..sol_count as usize] {
+                if potential_nonce != 0 {
+                    let is_valid = verify_nonce(&address, potential_nonce, &target);
+                    if is_valid {
+                        let mut submitted = submitted_nonces.lock().await;
+                        if !submitted.contains(&potential_nonce) {
+                            submitted.insert(potential_nonce);
+                            match submit_solution(
+                                &contract,
+                                &private_key,
+                                &web3,
+                                address,
+                                potential_nonce,
+                                submitted_nonces.clone(),
+                                tx_nonce_counter.clone(),
+                            ).await {
+                                Ok(_) => {
+                                    solutions_submitted += 1;
+                                },
+                                Err(_) => {
+                                    solutions_rejected += 1;
                                 }
                             }
                         } else {
-                            warn!("Nonce {} is invalid. Not submitting.", potential_nonce);
+                            solutions_rejected += 1;
                         }
+                    } else {
+                        solutions_rejected += 1;
                     }
                 }
             }
-
-            // Dynamic Load Adjustment based on hashrate
-            if hashrate < target_hashrate {
-                info!("Hashrate below target. Increasing batch size by 10%.");
-                current_batch_size = ((current_batch_size as f64 * 1.1).min(10_000_000.0)) as u64;
-                if current_batch_size >= 10_000_000 {
-                    warn!("Batch size capped at maximum: {}", current_batch_size);
-                }
-                debug!("Adjusted batch size to {}", current_batch_size);
-            } else if hashrate > target_hashrate * 1.2 {
-                info!("Hashrate above target. Decreasing batch size by 10%.");
-                current_batch_size = ((current_batch_size as f64 * 0.9).max(1_000.0)) as u64;
-                if current_batch_size <= 1_000 {
-                    warn!("Batch size set to minimum: {}", current_batch_size);
-                }
-                debug!("Adjusted batch size to {}", current_batch_size);
-            } else {
-                debug!("Hashrate within target range. Maintaining batch size at {}.", current_batch_size);
-            }
-        }
-    }}
-
-    #[tokio::main]
-    async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Initialize the customized logger
-        initialize_logger();
-
-        // Parse command-line arguments
-        let matches = Command::new("PolyMiner")
-            .version("1.0")
-            .about("GPU miner for Polymine")
-            .arg(
-                Arg::new("rpc_url")
-                    .long("rpc")
-                    .required(true)
-                    .help("RPC URL for the blockchain network"),
-            )
-            .arg(
-                Arg::new("contract_address")
-                    .long("contract")
-                    .required(true)
-                    .help("Smart contract address"),
-            )
-            .arg(
-                Arg::new("wallet_address")
-                    .long("wallet")
-                    .required(true)
-                    .help("Your wallet address"),
-            )
-            .arg(
-                Arg::new("private_key")
-                    .long("private")
-                    .required(true)
-                    .help("Your wallet's private key (hex)"),
-            )
-            .arg(
-                Arg::new("batch_size")
-                    .long("batch")
-                    .default_value("10000")
-                    .value_parser(clap::value_parser!(u64))
-                    .help("Initial batch size for mining"),
-            )
-            .arg(
-                Arg::new("device-indices")
-                    .long("device-indices")
-                    .default_value("all")
-                    .help("Comma-separated GPU indices to use (e.g., 0,1,2) or 'all'"),
-            )
-            .get_matches();
-
-        let rpc_url = matches.get_one::<String>("rpc_url").unwrap();
-        let contract_address: Address = matches
-            .get_one::<String>("contract_address")
-            .unwrap()
-            .parse()?;
-        let wallet_address: Address = matches
-            .get_one::<String>("wallet_address")
-            .unwrap()
-            .parse()?;
-        let private_key_hex = matches.get_one::<String>("private_key").unwrap();
-        let private_key = SecretKey::from_slice(&hex::decode(private_key_hex)?)?;
-        let batch_size = *matches.get_one::<u64>("batch_size").unwrap();
-        let device_indices = matches.get_one::<String>("device-indices").unwrap();
-
-        info!("Connecting to RPC at {}", rpc_url);
-        let transport = Http::new(rpc_url)?;
-        let web3 = Web3::new(transport);
-        let abi = include_bytes!("contract_abi.json");
-        let contract = Contract::from_json(web3.eth(), contract_address, abi)?;
-
-        display_wallet_balance(&web3, wallet_address).await?;
-
-        let initial_difficulty = fetch_difficulty(&contract).await?;
-        let target = compute_target(initial_difficulty);
-
-        let devices = list_gpus()?;
-        let selected_devices: Vec<_> = if device_indices == "all" {
-            devices
-        } else {
-            device_indices
-                .split(',')
-                .filter_map(|idx| idx.parse::<usize>().ok().and_then(|i| devices.get(i)))
-                .cloned()
-                .collect()
-        };
-
-        if selected_devices.is_empty() {
-            panic!("No GPUs selected or invalid indices provided.");
         }
 
-        // Load existing miner state or start fresh
-        let state = load_state(&web3, wallet_address).await;
-        let submitted_nonces = Arc::new(Mutex::new(state.submitted_nonces.clone()));
-        let global_nonce_counter = Arc::new(Mutex::new(state.global_nonce));
-        let tx_nonce_counter = Arc::new(Mutex::new(state.tx_nonce));
-
-        let mut handles = Vec::new();
-
-        for (i, (platform, device)) in selected_devices.iter().enumerate() {
-            info!(
-                "Using GPU at index {}: {} on platform {}",
-                i,
-                device.name()?,
-                platform.name()?
-            );
-            let (queue, kernel) = setup_opencl(platform, device)?;
-            let contract_clone = contract.clone();
-            let address = wallet_address;
-            let private_key_clone = private_key.clone();
-            let target_clone = target.clone();
-            let web3_clone = web3.clone();
-            let submitted_nonces_clone = Arc::clone(&submitted_nonces);
-            let global_nonce_clone = Arc::clone(&global_nonce_counter);
-            let tx_nonce_counter_clone = Arc::clone(&tx_nonce_counter); // Clone tx_nonce_counter
-
-            // Calibration Phase - Called Once Per GPU
-            let calibration_hashrate = calibrate_gpu(&kernel, &queue, batch_size).await?;
-            info!("Calibration Hashrate: {:.2} H/s", calibration_hashrate);
-
-            // Adjust target hashrate based on calibration
-            let dynamic_target_hashrate = calibration_hashrate * 0.9; // Target is 90% of calibration hashrate
-
-            handles.push(tokio::spawn(async move {
-                gpu_mine_single(
-                    contract_clone,
-                    address,
-                    private_key_clone,
-                    queue,
-                    kernel,
-                    target_clone,
-                    batch_size,
-                    global_nonce_clone,
-                    web3_clone,
-                    submitted_nonces_clone,
-                    dynamic_target_hashrate,
-                    tx_nonce_counter_clone, // Pass the tx_nonce_counter
-                )
-                .await
-            }));
+        // Dynamic Load Adjustment
+        if hashrate < target_hashrate {
+            current_batch_size = ((current_batch_size as f64 * 1.1).min(10_000_000.0)) as u64;
+        } else if hashrate > target_hashrate * 1.2 {
+            current_batch_size = ((current_batch_size as f64 * 0.9).max(1_000.0)) as u64;
         }
-
-        // Clone shared state for the shutdown handler
-        let submitted_nonces_clone = Arc::clone(&submitted_nonces);
-        let global_nonce_clone = Arc::clone(&global_nonce_counter);
-        let tx_nonce_counter_clone = Arc::clone(&tx_nonce_counter);
-
-        // Spawn a task to listen for shutdown signals (e.g., Ctrl+C)
-        tokio::spawn(async move {
-            // Wait for Ctrl+C signal
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for Ctrl+C");
-
-            info!("Shutdown signal received. Saving state...");
-
-            // Acquire locks to retrieve the current state
-            let submitted_nonces = submitted_nonces_clone.lock().await.clone();
-            let global_nonce = *global_nonce_clone.lock().await;
-            let tx_nonce = *tx_nonce_counter_clone.lock().await;
-
-            let final_state = MinerState {
-                submitted_nonces,
-                global_nonce,
-                tx_nonce,
-            };
-
-            // Save the state to a file
-            save_state(&final_state);
-            info!("State saved successfully. Exiting.");
-
-            // Exit the process gracefully
-            std::process::exit(0);
-        });
-
-        // Await all mining tasks
-        for handle in handles {
-            handle.await??;
-        }
-
-        // Save miner state before exiting (if mining tasks ever complete)
-        let final_state = MinerState {
-            submitted_nonces: submitted_nonces.lock().await.clone(),
-            global_nonce: *global_nonce_counter.lock().await,
-            tx_nonce: *tx_nonce_counter.lock().await,
-        };
-        save_state(&final_state);
-
-        Ok(())
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    initialize_logger();
+
+    // Parse command-line arguments
+    let matches = Command::new("PolyMiner")
+        .version("1.0")
+        .about("GPU miner for Polymine")
+        .arg(
+            Arg::new("rpc_url")
+                .long("rpc")
+                .required(true)
+                .help("RPC URL for the blockchain network"),
+        )
+        .arg(
+            Arg::new("contract_address")
+                .long("contract")
+                .required(true)
+                .help("Smart contract address"),
+        )
+        .arg(
+            Arg::new("wallet_address")
+                .long("wallet")
+                .required(true)
+                .help("Your wallet address"),
+        )
+        .arg(
+            Arg::new("private_key")
+                .long("private")
+                .required(true)
+                .help("Your wallet's private key (hex)"),
+        )
+        .arg(
+            Arg::new("batch_size")
+                .long("batch")
+                .default_value("10000")
+                .value_parser(clap::value_parser!(u64))
+                .help("Initial batch size for mining"),
+        )
+        .arg(
+            Arg::new("device-indices")
+                .long("device-indices")
+                .default_value("all")
+                .help("Comma-separated GPU indices to use (e.g., 0,1,2) or 'all'"),
+        )
+        .get_matches();
+
+    let rpc_url = matches.get_one::<String>("rpc_url").unwrap();
+    let contract_address: Address = matches.get_one::<String>("contract_address").unwrap().parse()?;
+    let wallet_address: Address = matches.get_one::<String>("wallet_address").unwrap().parse()?;
+    let private_key_hex = matches.get_one::<String>("private_key").unwrap();
+    let private_key = SecretKey::from_slice(&hex::decode(private_key_hex)?)?;
+    let batch_size = *matches.get_one::<u64>("batch_size").unwrap();
+    let device_indices = matches.get_one::<String>("device-indices").unwrap();
+
+    info!("Connecting to RPC at {}", rpc_url);
+    let transport = Http::new(rpc_url)?;
+    let web3 = Web3::new(transport);
+    let abi = include_bytes!("contract_abi.json");
+    let contract = Contract::from_json(web3.eth(), contract_address, abi)?;
+
+    display_wallet_balance(&web3, wallet_address).await?;
+
+    let initial_difficulty = fetch_difficulty(&contract).await?;
+    let target = compute_target(initial_difficulty);
+
+    let devices = list_gpus()?;
+    let selected_devices: Vec<_> = if device_indices == "all" {
+        devices
+    } else {
+        device_indices
+            .split(',')
+            .filter_map(|idx| idx.parse::<usize>().ok().and_then(|i| devices.get(i)))
+            .cloned()
+            .collect()
+    };
+
+    if selected_devices.is_empty() {
+        panic!("No GPUs selected or invalid indices provided.");
+    }
+
+    // Load existing miner state or start fresh
+    let state = load_state(&web3, wallet_address).await;
+    let submitted_nonces = Arc::new(Mutex::new(state.submitted_nonces.clone()));
+    let global_nonce_counter = Arc::new(Mutex::new(state.global_nonce));
+    let tx_nonce_counter = Arc::new(Mutex::new(state.tx_nonce));
+
+    for (i, (platform, device)) in selected_devices.iter().enumerate() {
+        info!(
+            "Using GPU at index {}: {} on platform {}",
+            i,
+            device.name()?,
+            platform.name()?
+        );
+        let (queue, kernel) = setup_opencl(platform, device)?;
+        let calibration_hashrate = calibrate_gpu(&kernel, &queue, batch_size).await?;
+        info!("Calibration Hashrate: {:.2} H/s", calibration_hashrate);
+
+        let dynamic_target_hashrate = calibration_hashrate * 0.9;
+
+        tokio::spawn(gpu_mine_single(
+            contract.clone(),
+            wallet_address,
+            private_key.clone(),
+            queue,
+            kernel,
+            target.clone(),
+            batch_size,
+            Arc::clone(&global_nonce_counter),
+            web3.clone(),
+            Arc::clone(&submitted_nonces),
+            dynamic_target_hashrate,
+            Arc::clone(&tx_nonce_counter),
+        ));
+    }
+
+    // Clone shared state for the shutdown handler
+    let submitted_nonces_clone = Arc::clone(&submitted_nonces);
+    let global_nonce_clone = Arc::clone(&global_nonce_counter);
+    let tx_nonce_counter_clone = Arc::clone(&tx_nonce_counter);
+
+    // Spawn a task to listen for shutdown signals (e.g., Ctrl+C)
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
+        info!("Shutdown signal received. Saving state...");
+
+        let submitted_nonces = submitted_nonces_clone.lock().await.clone();
+        let global_nonce = *global_nonce_clone.lock().await;
+        let tx_nonce = *tx_nonce_counter_clone.lock().await;
+
+        let final_state = MinerState {
+            submitted_nonces,
+            global_nonce,
+            tx_nonce,
+        };
+
+        save_state(&final_state);
+        info!("State saved successfully. Exiting.");
+        std::process::exit(0);
+    });
+
+    // Keep the main task running indefinitely or until a shutdown signal
+    // Note: Mining tasks are spawned as background tasks, they will keep running
+    // until the program is shut down.
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await; // Sleep for an hour, just to keep the process alive
+    }
+
+    // This code will never be reached due to the loop above, but included for completeness
+    // Ok(())
+}
 
     #[cfg(test)]
     mod tests {
