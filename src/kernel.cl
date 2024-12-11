@@ -1,4 +1,3 @@
-
 // Define a structure for nonce vectors
 typedef struct {
     ulong n0;
@@ -133,8 +132,6 @@ void keccak256(const uchar *input, size_t len, uchar *output) {
         int byte_in_lane = i % 8;
         output[i] = (uchar)((state[lane] >> (8 * byte_in_lane)) & 0xFF);
     }
-    
-    // No dynamic memory allocation needed
 }
 
 // The main kernel function for mining
@@ -188,19 +185,31 @@ __kernel void hashMessage(
         uchar hash[32];
         keccak256(full_message, 52, hash);
         
-        // Compare the computed hash with the target
-       bool is_valid = true;
-        for(int k = 0; k < 32 && is_valid; k++) {
-            if(hash[k] > target_local[k]) {
-                is_valid = false;
-            }
-            else if(hash[k] < target_local[k]) {
-                 break; // Early exit if hash is less than target at any point
-                }
-            }
+        // Copy target from local to private memory for comparison
+        ulong target_high, target_low;
+        target_high = (ulong)target_local[0] << 56 | (ulong)target_local[1] << 48 | 
+                      (ulong)target_local[2] << 40 | (ulong)target_local[3] << 32 | 
+                      (ulong)target_local[4] << 24 | (ulong)target_local[5] << 16 | 
+                      (ulong)target_local[6] << 8  | (ulong)target_local[7];
         
-        // If a valid nonce is found, store it atomically
-        if(is_valid) {
+        target_low = (ulong)target_local[8] << 56 | (ulong)target_local[9] << 48 | 
+                     (ulong)target_local[10] << 40 | (ulong)target_local[11] << 32 | 
+                     (ulong)target_local[12] << 24 | (ulong)target_local[13] << 16 | 
+                     (ulong)target_local[14] << 8  | (ulong)target_local[15];
+        
+        // Convert hash to big integers for comparison
+        ulong hash_high = (ulong)hash[0] << 56 | (ulong)hash[1] << 48 | 
+                          (ulong)hash[2] << 40 | (ulong)hash[3] << 32 | 
+                          (ulong)hash[4] << 24 | (ulong)hash[5] << 16 | 
+                          (ulong)hash[6] << 8  | (ulong)hash[7];
+        
+        ulong hash_low = (ulong)hash[8] << 56 | (ulong)hash[9] << 48 | 
+                         (ulong)hash[10] << 40 | (ulong)hash[11] << 32 | 
+                         (ulong)hash[12] << 24 | (ulong)hash[13] << 16 | 
+                         (ulong)hash[14] << 8  | (ulong)hash[15];
+        
+        // Compare hash with target as big-endian 256-bit numbers
+        if(hash_high < target_high || (hash_high == target_high && hash_low < target_low)) {
             uint count = atomic_inc(solution_count);
             if(count < maxSolutionCount) {
                 solutions[count] = current_nonce;
